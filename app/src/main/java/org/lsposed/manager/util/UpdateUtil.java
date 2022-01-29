@@ -90,8 +90,8 @@ public class UpdateUtil {
         var pref = App.getPreferences();
         if (!pref.getBoolean("checked", false)) return false;
         var code = pref.getInt("latest_version", 0);
-        if (code > BuildConfig.VERSION_CODE) return true;
         
+        return code > BuildConfig.VERSION_CODE;
     }
 
     @Nullable

@@ -94,12 +94,12 @@ public class UpdateUtil {
         var check = pref.getLong("latest_check", 0);
         if (check > 0) {
             var checkTime = Instant.ofEpochSecond(check);
-            if (checkTime.atOffset(ZoneOffset.UTC).plusDays(30).toInstant().isBefore(now))
+            if (checkTime.atOffset(ZoneOffset.UTC).plusDays(0).toInstant().isBefore(now))
                 return true;
             var code = pref.getInt("latest_version", 0);
             return code > BuildConfig.VERSION_CODE;
         }
-        return buildTime.atOffset(ZoneOffset.UTC).plusDays(30).toInstant().isBefore(now);
+        return buildTime.atOffset(ZoneOffset.UTC).plusDays(0).toInstant().isBefore(now);
     }
 
     @Nullable

@@ -17,13 +17,13 @@
  * Copyright (C) 2021 LSPosed Contributors
  */
 
-import com.android.build.gradle.BaseExtension
+import com.android.build.api.dsl.ApplicationExtension
 import com.android.ide.common.signing.KeystoreHelper
 import java.io.PrintStream
-import java.util.*
 
 plugins {
-    id("com.android.application")
+    alias(libs.plugins.agp.app)
+    alias(libs.plugins.lsplugin.resopt)
 }
 
 val daemonName = "LSPosed"
@@ -31,45 +31,19 @@ val daemonName = "LSPosed"
 val injectedPackageName: String by rootProject.extra
 val injectedPackageUid: Int by rootProject.extra
 
-val agpVersion: String by rootProject.extra
+val agpVersion: String by project
 
 val defaultManagerPackageName: String by rootProject.extra
-val apiCode: Int by rootProject.extra
-val verCode: Int by rootProject.extra
-val verName: String by rootProject.extra
-
-val androidTargetSdkVersion: Int by rootProject.extra
-val androidMinSdkVersion: Int by rootProject.extra
-val androidBuildToolsVersion: String by rootProject.extra
-val androidCompileSdkVersion: Int by rootProject.extra
-val androidCompileNdkVersion: String by rootProject.extra
-val androidSourceCompatibility: JavaVersion by rootProject.extra
-val androidTargetCompatibility: JavaVersion by rootProject.extra
 
 android {
-    compileSdk = androidCompileSdkVersion
-    ndkVersion = androidCompileNdkVersion
-    buildToolsVersion = androidBuildToolsVersion
-
     buildFeatures {
         prefab = true
+        buildConfig = true
     }
 
     defaultConfig {
         applicationId = "org.lsposed.daemon"
-        minSdk = androidMinSdkVersion
-        targetSdk = androidTargetSdkVersion
-        versionCode = verCode
-        versionName = verName
-        multiDexEnabled = false
 
-        externalNativeBuild {
-            ndkBuild {
-                arguments += "-j${Runtime.getRuntime().availableProcessors()}"
-            }
-        }
-
-        buildConfigField("int", "API_CODE", "$apiCode")
         buildConfigField(
             "String",
             "DEFAULT_MANAGER_PACKAGE_NAME",
@@ -79,55 +53,44 @@ android {
         buildConfigField("int", "MANAGER_INJECTED_UID", """$injectedPackageUid""")
     }
 
-    lint {
-        abortOnError = true
-        checkReleaseBuilds = false
-    }
-
     buildTypes {
+        all {
+            externalNativeBuild {
+                cmake {
+                    arguments += "-DANDROID_ALLOW_UNDEFINED_SYMBOLS=true"
+                }
+            }
+        }
         release {
             isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles("proguard-rules.pro")
         }
     }
 
     externalNativeBuild {
-        ndkBuild {
-            path("src/main/cpp/Android.mk")
+        cmake {
+            path("src/main/jni/CMakeLists.txt")
         }
     }
 
-    compileOptions {
-        targetCompatibility(androidTargetCompatibility)
-        sourceCompatibility(androidSourceCompatibility)
-    }
-
-    buildTypes {
-        all {
-            externalNativeBuild {
-                ndkBuild {
-                    arguments += "NDK_OUT=${File(buildDir, ".cxx/$name").absolutePath}"
-                }
-            }
-        }
-    }
+    namespace = "org.lsposed.daemon"
 }
 
-fun afterEval() = android.applicationVariants.forEach { variant ->
-    val variantCapped = variant.name.capitalize(Locale.ROOT)
-    val variantLowered = variant.name.toLowerCase(Locale.ROOT)
+android.applicationVariants.all {
+    val variantCapped = name.replaceFirstChar { it.uppercase() }
+    val variantLowered = name.lowercase()
 
-    tasks["merge${variantCapped}JniLibFolders"].enabled = false
-    tasks["merge${variantCapped}NativeLibs"].enabled = false
-
-    val app = rootProject.project(":app").extensions.getByName<BaseExtension>("android")
-    val outSrcDir = file("$buildDir/generated/source/signInfo/${variantLowered}")
-    val outSrc = file("$outSrcDir/org/lsposed/lspd/util/SignInfo.java")
+    val outSrcDir =
+        layout.buildDirectory.dir("generated/source/signInfo/${variantLowered}").get()
     val signInfoTask = tasks.register("generate${variantCapped}SignInfo") {
         dependsOn(":app:validateSigning${variantCapped}")
+        val sign = rootProject.project(":app").extensions
+            .getByType(ApplicationExtension::class.java)
+            .buildTypes.named(variantLowered).get().signingConfig
+        val outSrc = file("$outSrcDir/org/lsposed/lspd/util/SignInfo.java")
         outputs.file(outSrc)
         doLast {
-            val sign = app.buildTypes.named(variantLowered).get().signingConfig
             outSrc.parentFile.mkdirs()
             val certificateInfo = KeystoreHelper.getCertificateInfo(
                 sign?.storeType,
@@ -147,21 +110,16 @@ fun afterEval() = android.applicationVariants.forEach { variant ->
             )
         }
     }
-    variant.registerJavaGeneratingTask(signInfoTask, outSrcDir)
-}
-
-afterEvaluate {
-    afterEval()
+    registerJavaGeneratingTask(signInfoTask, outSrcDir.asFile)
 }
 
 dependencies {
-
-    implementation("dev.rikka.ndk.thirdparty:cxx:1.2.0")
-    implementation("com.android.tools.build:apksig:$agpVersion")
-    implementation("org.apache.commons:commons-lang3:3.12.0")
-    compileOnly("androidx.annotation:annotation:1.3.0")
-    compileOnly(project(":hiddenapi-stubs"))
-    implementation(project(":hiddenapi-bridge"))
-    implementation(project(":daemon-service"))
-    implementation(project(":manager-service"))
+    implementation(libs.libxposed.`interface`)
+    implementation(libs.agp.apksig)
+    implementation(libs.commons.lang3)
+    implementation(projects.hiddenapi.bridge)
+    implementation(projects.services.daemonService)
+    implementation(projects.services.managerService)
+    compileOnly(libs.androidx.annotation)
+    compileOnly(projects.hiddenapi.stubs)
 }

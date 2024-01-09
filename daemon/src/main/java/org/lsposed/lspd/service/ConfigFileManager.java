@@ -1,3 +1,22 @@
+/*
+ * This file is part of LSPosed.
+ *
+ * LSPosed is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * LSPosed is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with LSPosed.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ * Copyright (C) 2021 - 2022 LSPosed Contributors
+ */
+
 package org.lsposed.lspd.service;
 
 import static org.lsposed.lspd.service.ServiceManager.TAG;
@@ -5,8 +24,10 @@ import static org.lsposed.lspd.service.ServiceManager.toGlobalNamespace;
 
 import android.content.res.AssetManager;
 import android.content.res.Resources;
+import android.os.Binder;
 import android.os.ParcelFileDescriptor;
 import android.os.Process;
+import android.os.RemoteException;
 import android.os.SELinux;
 import android.os.SharedMemory;
 import android.system.ErrnoException;
@@ -16,14 +37,19 @@ import android.util.Log;
 
 import androidx.annotation.Nullable;
 
+import org.lsposed.daemon.BuildConfig;
 import org.lsposed.lspd.models.PreLoadedApk;
 import org.lsposed.lspd.util.InstallerVerifier;
 import org.lsposed.lspd.util.Utils;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.lang.reflect.Method;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
@@ -42,21 +68,24 @@ import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
+import java.util.Locale;
+import java.util.zip.Deflater;
+import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
+import java.util.zip.ZipOutputStream;
 
 import hidden.HiddenApiBridge;
 
 public class ConfigFileManager {
     static final Path basePath = Paths.get("/data/adb/lspd");
+    static final Path modulePath = basePath.resolve("modules");
     static final Path daemonApkPath = Paths.get(System.getProperty("java.class.path", null));
-    static final Path managerApkPath = basePath.resolve("manager.apk");
+    static final Path managerApkPath = daemonApkPath.getParent().resolve("manager.apk");
+    static final File magiskDbPath = new File("/data/adb/magisk.db");
     private static final Path lockPath = basePath.resolve("lock");
     private static final Path configDirPath = basePath.resolve("config");
     static final File dbPath = configDirPath.resolve("modules_config.db").toFile();
-    static final File magiskDbPath = new File("/data/adb/magisk.db");
     private static final Path logDirPath = basePath.resolve("log");
     private static final Path oldLogDirPath = basePath.resolve("log.old");
     private static final DateTimeFormatter formatter =
@@ -65,6 +94,7 @@ public class ConfigFileManager {
     private static FileLocker locker = null;
     private static Resources res = null;
     private static ParcelFileDescriptor fd = null;
+    private static SharedMemory preloadDex = null;
 
     static {
         try {
@@ -74,6 +104,15 @@ public class ConfigFileManager {
             createLogDirPath();
         } catch (IOException e) {
             Log.e(TAG, Log.getStackTraceString(e));
+        }
+    }
+
+    public static void transfer(InputStream in, OutputStream out) throws IOException {
+        int size = 8192;
+        var buffer = new byte[size];
+        int read;
+        while ((read = in.read(buffer, 0, size)) >= 0) {
+            out.write(buffer, 0, read);
         }
     }
 
@@ -97,9 +136,10 @@ public class ConfigFileManager {
             Method addAssetPath = AssetManager.class.getDeclaredMethod("addAssetPath", String.class);
             addAssetPath.setAccessible(true);
             //noinspection ConstantConditions
-            if ((int) addAssetPath.invoke(am, daemonApkPath.toString()) > 0)
+            if ((int) addAssetPath.invoke(am, daemonApkPath.toString()) > 0) {
                 //noinspection deprecation
                 res = new Resources(am, null, null);
+            }
         } catch (Throwable e) {
             Log.e(TAG, Log.getStackTraceString(e));
         }
@@ -119,7 +159,7 @@ public class ConfigFileManager {
 
     static ParcelFileDescriptor getManagerApk() throws IOException {
         if (fd != null) return fd.dup();
-        if (!InstallerVerifier.verifyInstallerSignature(managerApkPath.toString())) return null;
+        InstallerVerifier.verifyInstallerSignature(managerApkPath.toString());
 
         SELinux.setFileContext(managerApkPath.toString(), "u:object_r:system_file:s0");
         fd = ParcelFileDescriptor.open(managerApkPath.toFile(), ParcelFileDescriptor.MODE_READ_ONLY);
@@ -189,46 +229,131 @@ public class ConfigFileManager {
         return logDirPath.resolve(getNewLogFileName("modules")).toFile();
     }
 
-    static File getpropsLogPath() throws IOException {
+    static File getPropsPath() throws IOException {
         createLogDirPath();
         return logDirPath.resolve("props.txt").toFile();
     }
 
-    static Map<String, ParcelFileDescriptor> getLogs() {
-        var map = new LinkedHashMap<String, ParcelFileDescriptor>();
-        try {
-            putFds(map, logDirPath);
-            putFds(map, oldLogDirPath);
-            putFds(map, Paths.get("/data/tombstones"));
-            putFds(map, Paths.get("/data/anr"));
-        } catch (IOException e) {
-            Log.e(TAG, "getLogs", e);
-        }
-        return map;
+    static File getKmsgPath() throws IOException {
+        createLogDirPath();
+        return logDirPath.resolve("kmsg.log").toFile();
     }
 
-    private static void putFds(Map<String, ParcelFileDescriptor> map, Path path) throws IOException {
+    static void getLogs(ParcelFileDescriptor zipFd) throws IllegalStateException {
+        try (zipFd; var os = new ZipOutputStream(new FileOutputStream(zipFd.getFileDescriptor()))) {
+            var comment = String.format(Locale.ROOT, "LSPosed %s %s (%d)",
+                    BuildConfig.BUILD_TYPE, BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE);
+            os.setComment(comment);
+            os.setLevel(Deflater.BEST_COMPRESSION);
+            zipAddDir(os, logDirPath);
+            zipAddDir(os, oldLogDirPath);
+            zipAddDir(os, Paths.get("/data/tombstones"));
+            zipAddDir(os, Paths.get("/data/anr"));
+            var data = Paths.get("/data/data");
+            var app1 = data.resolve(BuildConfig.MANAGER_INJECTED_PKG_NAME + "/cache/crash");
+            var app2 = data.resolve(BuildConfig.DEFAULT_MANAGER_PACKAGE_NAME + "/cache/crash");
+            zipAddDir(os, app1);
+            zipAddDir(os, app2);
+            zipAddProcOutput(os, "full.log", "logcat", "-b", "all", "-d");
+            zipAddProcOutput(os, "dmesg.log", "dmesg");
+            var magiskDataDir = Paths.get("/data/adb");
+            try (var l = Files.list(magiskDataDir.resolve("modules"))) {
+                l.forEach(p -> {
+                    zipAddFile(os, p, magiskDataDir);
+                    zipAddFile(os, p.resolve("module.prop"), magiskDataDir);
+                    zipAddFile(os, p.resolve("remove"), magiskDataDir);
+                    zipAddFile(os, p.resolve("disable"), magiskDataDir);
+                    zipAddFile(os, p.resolve("update"), magiskDataDir);
+                    zipAddFile(os, p.resolve("sepolicy.rule"), magiskDataDir);
+                });
+            }
+            var proc = Paths.get("/proc");
+            for (var pid : new String[]{"self", String.valueOf(Binder.getCallingPid())}) {
+                var pidPath = proc.resolve(pid);
+                zipAddFile(os, pidPath.resolve("maps"), proc);
+                zipAddFile(os, pidPath.resolve("mountinfo"), proc);
+                zipAddFile(os, pidPath.resolve("status"), proc);
+            }
+            zipAddFile(os, dbPath.toPath(), configDirPath);
+            ConfigManager.getInstance().exportScopes(os);
+        } catch (Throwable e) {
+            Log.w(TAG, "get log", e);
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static void zipAddProcOutput(ZipOutputStream os, String name, String... command) {
+        try (var is = new ProcessBuilder(command).start().getInputStream()) {
+            os.putNextEntry(new ZipEntry(name));
+            transfer(is, os);
+            os.closeEntry();
+        } catch (IOException e) {
+            Log.w(TAG, name, e);
+        }
+    }
+
+    private static void zipAddFile(ZipOutputStream os, Path path, Path base) {
+        var name = base.relativize(path).toString();
+        if (Files.isDirectory(path)) {
+            try {
+                os.putNextEntry(new ZipEntry(name + "/"));
+                os.closeEntry();
+            } catch (IOException e) {
+                Log.w(TAG, name, e);
+            }
+        } else if (Files.exists(path)) {
+            try (var is = new FileInputStream(path.toFile())) {
+                os.putNextEntry(new ZipEntry(name));
+                transfer(is, os);
+                os.closeEntry();
+            } catch (IOException e) {
+                Log.w(TAG, name, e);
+            }
+        }
+    }
+
+    private static void zipAddDir(ZipOutputStream os, Path path) throws IOException {
+        if (!Files.isDirectory(path)) return;
         Files.walkFileTree(path, new SimpleFileVisitor<>() {
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                var name = path.getParent().relativize(file).toString();
-                var fd = ParcelFileDescriptor.open(file.toFile(), ParcelFileDescriptor.MODE_READ_ONLY);
-                map.put(name, fd);
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
+                if (Files.isRegularFile(file)) {
+                    var name = path.getParent().relativize(file).toString();
+                    try (var is = new FileInputStream(file.toFile())) {
+                        os.putNextEntry(new ZipEntry(name));
+                        transfer(is, os);
+                        os.closeEntry();
+                    } catch (IOException e) {
+                        Log.w(TAG, name, e);
+                    }
+                }
                 return FileVisitResult.CONTINUE;
             }
         });
     }
 
-    private static void readDexes(ZipFile apkFile, List<SharedMemory> preLoadedDexes) {
+    private static SharedMemory readDex(InputStream in, boolean obfuscate) throws IOException, ErrnoException {
+        var memory = SharedMemory.create(null, in.available());
+        var byteBuffer = memory.mapReadWrite();
+        Channels.newChannel(in).read(byteBuffer);
+        SharedMemory.unmap(byteBuffer);
+        if (obfuscate) {
+            var newMemory = ObfuscationManager.obfuscateDex(memory);
+            if (memory != newMemory) {
+                memory.close();
+                memory = newMemory;
+            }
+        }
+        memory.setProtect(OsConstants.PROT_READ);
+        return memory;
+    }
+
+    private static void readDexes(ZipFile apkFile, List<SharedMemory> preLoadedDexes,
+                                  boolean obfuscate) {
         int secondary = 2;
         for (var dexFile = apkFile.getEntry("classes.dex"); dexFile != null;
              dexFile = apkFile.getEntry("classes" + secondary + ".dex"), secondary++) {
-            try (var in = apkFile.getInputStream(dexFile)) {
-                var memory = SharedMemory.create(null, in.available());
-                var byteBuffer = memory.mapReadWrite();
-                Channels.newChannel(in).read(byteBuffer);
-                SharedMemory.unmap(byteBuffer);
-                memory.setProtect(OsConstants.PROT_READ);
-                preLoadedDexes.add(memory);
+            try (var is = apkFile.getInputStream(dexFile)) {
+                preLoadedDexes.add(readDex(is, obfuscate));
             } catch (IOException | ErrnoException e) {
                 Log.w(TAG, "Can not load " + dexFile + " in " + apkFile, e);
             }
@@ -246,28 +371,48 @@ public class ConfigFileManager {
                 if (name.isEmpty() || name.startsWith("#")) continue;
                 names.add(name);
             }
-        } catch (IOException e) {
+        } catch (IOException | OutOfMemoryError e) {
             Log.e(TAG, "Can not open " + initEntry, e);
         }
     }
 
     @Nullable
-    static PreLoadedApk loadModule(String path) {
+    static PreLoadedApk loadModule(String path, boolean obfuscate) {
         if (path == null) return null;
         var file = new PreLoadedApk();
         var preLoadedDexes = new ArrayList<SharedMemory>();
         var moduleClassNames = new ArrayList<String>(1);
         var moduleLibraryNames = new ArrayList<String>(1);
         try (var apkFile = new ZipFile(toGlobalNamespace(path))) {
-            readDexes(apkFile, preLoadedDexes);
-            readName(apkFile, "assets/xposed_init", moduleClassNames);
-            readName(apkFile, "assets/native_init", moduleLibraryNames);
+            readDexes(apkFile, preLoadedDexes, obfuscate);
+            readName(apkFile, "META-INF/xposed/java_init.list", moduleClassNames);
+            if (moduleClassNames.isEmpty()) {
+                file.legacy = true;
+                readName(apkFile, "assets/xposed_init", moduleClassNames);
+                readName(apkFile, "assets/native_init", moduleLibraryNames);
+            } else {
+                file.legacy = false;
+                readName(apkFile, "META-INF/xposed/native_init.list", moduleLibraryNames);
+            }
         } catch (IOException e) {
             Log.e(TAG, "Can not open " + path, e);
             return null;
         }
         if (preLoadedDexes.isEmpty()) return null;
         if (moduleClassNames.isEmpty()) return null;
+
+        if (obfuscate) {
+            var signatures = ObfuscationManager.getSignatures();
+            for (int i = 0; i < moduleClassNames.size(); i++) {
+                var s = moduleClassNames.get(i);
+                for (var entry : signatures.entrySet()) {
+                    if (s.startsWith(entry.getKey())) {
+                        moduleClassNames.add(i, s.replace(entry.getKey(), entry.getValue()));
+                    }
+                }
+            }
+        }
+
         file.preLoadedDexes = preLoadedDexes;
         file.moduleClassNames = moduleClassNames;
         file.moduleLibraryNames = moduleLibraryNames;
@@ -288,6 +433,39 @@ public class ConfigFileManager {
         } catch (Throwable e) {
             return false;
         }
+    }
+
+    synchronized static SharedMemory getPreloadDex(boolean obfuscate) {
+        if (preloadDex == null) {
+            try (var is = new FileInputStream("framework/lspd.dex")) {
+                preloadDex = readDex(is, obfuscate);
+            } catch (Throwable e) {
+                Log.e(TAG, "preload dex", e);
+            }
+        }
+        return preloadDex;
+    }
+
+    static void ensureModuleFilePath(String path) throws RemoteException {
+        if (path == null || path.indexOf(File.separatorChar) >= 0 || ".".equals(path) || "..".equals(path)) {
+            throw new RemoteException("Invalid path: " + path);
+        }
+    }
+
+    static Path resolveModuleDir(String packageName, String dir, int userId, int uid) throws IOException {
+        var path = modulePath.resolve(String.valueOf(userId)).resolve(packageName).resolve(dir).normalize();
+        if (uid != -1) {
+            if (path.toFile().mkdirs()) {
+                try {
+                    SELinux.setFileContext(path.toString(), "u:object_r:magisk_file:s0");
+                    Os.chown(path.toString(), uid, uid);
+                    Os.chmod(path.toString(), 0755);
+                } catch (ErrnoException e) {
+                    throw new IOException(e);
+                }
+            }
+        }
+        return path;
     }
 
     private static class FileLocker {

@@ -33,6 +33,7 @@ import android.content.pm.IPackageManager;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
+import android.content.pm.ParceledListSlice;
 import android.content.pm.ResolveInfo;
 import android.content.pm.ServiceInfo;
 import android.content.pm.VersionedPackage;
@@ -46,6 +47,7 @@ import android.util.Log;
 import android.util.Pair;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import org.lsposed.lspd.models.Application;
 
@@ -61,7 +63,7 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.stream.Collectors;
 
-import io.github.xposed.xposedservice.utils.ParceledListSlice;
+import rikka.parcelablelist.ParcelableListSlice;
 
 public class PackageService {
 
@@ -91,7 +93,7 @@ public class PackageService {
     };
 
     private static IPackageManager getPackageManager() {
-        if (binder == null && pm == null) {
+        if (binder == null || pm == null) {
             binder = ServiceManager.getService("package");
             if (binder == null) return null;
             try {
@@ -104,9 +106,13 @@ public class PackageService {
         return pm;
     }
 
+    @Nullable
     public static PackageInfo getPackageInfo(String packageName, int flags, int userId) throws RemoteException {
         IPackageManager pm = getPackageManager();
         if (pm == null) return null;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            return pm.getPackageInfo(packageName, (long) flags, userId);
+        }
         return pm.getPackageInfo(packageName, flags, userId);
     }
 
@@ -116,28 +122,49 @@ public class PackageService {
         Map<Integer, PackageInfo> res = new HashMap<>();
         if (pm == null) return res;
         for (var user : UserService.getUsers()) {
-            var info = pm.getPackageInfo(packageName, flags, user.id);
+            var info = getPackageInfo(packageName, flags, user.id);
             if (info != null && info.applicationInfo != null) res.put(user.id, info);
         }
         return res;
     }
 
+    @Nullable
     public static ApplicationInfo getApplicationInfo(String packageName, int flags, int userId) throws RemoteException {
         IPackageManager pm = getPackageManager();
         if (pm == null) return null;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            return pm.getApplicationInfo(packageName, (long) flags, userId);
+        }
         return pm.getApplicationInfo(packageName, flags, userId);
     }
 
-    public static ParceledListSlice<PackageInfo> getInstalledPackagesFromAllUsers(int flags, boolean filterNoProcess) throws RemoteException {
+    // Only for manager
+    public static ParcelableListSlice<PackageInfo> getInstalledPackagesFromAllUsers(int flags, boolean filterNoProcess) throws RemoteException {
         List<PackageInfo> res = new ArrayList<>();
         IPackageManager pm = getPackageManager();
-        if (pm == null) return ParceledListSlice.emptyList();
+        if (pm == null) return ParcelableListSlice.emptyList();
         for (var user : UserService.getUsers()) {
             // in case pkginfo of other users in primary user
-            res.addAll(pm.getInstalledPackages(flags, user.id).getList().parallelStream().filter(info -> info.applicationInfo != null && info.applicationInfo.uid / PER_USER_RANGE == user.id).collect(Collectors.toList()));
+            ParceledListSlice<PackageInfo> infos;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                infos = pm.getInstalledPackages((long) flags, user.id);
+            } else {
+                infos = pm.getInstalledPackages(flags, user.id);
+            }
+            res.addAll(infos
+                    .getList().parallelStream()
+                    .filter(info -> info.applicationInfo != null && info.applicationInfo.uid / PER_USER_RANGE == user.id)
+                    .filter(info -> {
+                        try {
+                            return isPackageAvailable(info.packageName, user.id, true);
+                        } catch (RemoteException e) {
+                            return false;
+                        }
+                    })
+                    .collect(Collectors.toList()));
         }
         if (filterNoProcess) {
-            return new ParceledListSlice<>(res.parallelStream().filter(packageInfo -> {
+            return new ParcelableListSlice<>(res.parallelStream().filter(packageInfo -> {
                 try {
                     PackageInfo pkgInfo = getPackageInfoWithComponents(packageInfo.packageName, MATCH_ALL_FLAGS, packageInfo.applicationInfo.uid / PER_USER_RANGE);
                     return !fetchProcesses(pkgInfo).isEmpty();
@@ -147,7 +174,7 @@ public class PackageService {
                 }
             }).collect(Collectors.toList()));
         }
-        return new ParceledListSlice<>(res);
+        return new ParcelableListSlice<>(res);
     }
 
     private static Set<String> fetchProcesses(PackageInfo pkgInfo) {
@@ -181,32 +208,34 @@ public class PackageService {
         return pm.isPackageAvailable(packageName, userId) || (ignoreHidden && pm.getApplicationHiddenSettingAsUser(packageName, userId));
     }
 
+    @SuppressWarnings({"ConstantConditions", "SameParameterValue"})
+    @Nullable
     private static PackageInfo getPackageInfoWithComponents(String packageName, int flags, int userId) throws RemoteException {
         IPackageManager pm = getPackageManager();
         if (pm == null) return null;
         PackageInfo pkgInfo;
         try {
-            pkgInfo = pm.getPackageInfo(packageName, flags | PackageManager.GET_ACTIVITIES | PackageManager.GET_SERVICES | PackageManager.GET_RECEIVERS | PackageManager.GET_PROVIDERS, userId);
+            pkgInfo = getPackageInfo(packageName, flags | PackageManager.GET_ACTIVITIES | PackageManager.GET_SERVICES | PackageManager.GET_RECEIVERS | PackageManager.GET_PROVIDERS, userId);
         } catch (Exception e) {
-            pkgInfo = pm.getPackageInfo(packageName, flags, userId);
+            pkgInfo = getPackageInfo(packageName, flags, userId);
             if (pkgInfo == null) return null;
             try {
-                pkgInfo.activities = pm.getPackageInfo(packageName, flags | PackageManager.GET_ACTIVITIES, userId).activities;
+                pkgInfo.activities = getPackageInfo(packageName, flags | PackageManager.GET_ACTIVITIES, userId).activities;
             } catch (Exception ignored) {
 
             }
             try {
-                pkgInfo.services = pm.getPackageInfo(packageName, flags | PackageManager.GET_SERVICES, userId).services;
+                pkgInfo.services = getPackageInfo(packageName, flags | PackageManager.GET_SERVICES, userId).services;
             } catch (Exception ignored) {
 
             }
             try {
-                pkgInfo.receivers = pm.getPackageInfo(packageName, flags | PackageManager.GET_RECEIVERS, userId).receivers;
+                pkgInfo.receivers = getPackageInfo(packageName, flags | PackageManager.GET_RECEIVERS, userId).receivers;
             } catch (Exception ignored) {
 
             }
             try {
-                pkgInfo.providers = pm.getPackageInfo(packageName, flags | PackageManager.GET_PROVIDERS, userId).providers;
+                pkgInfo.providers = getPackageInfo(packageName, flags | PackageManager.GET_PROVIDERS, userId).providers;
             } catch (Exception ignored) {
 
             }
@@ -266,27 +295,40 @@ public class PackageService {
         }
     }
 
-    public static ParceledListSlice<ResolveInfo> queryIntentActivities(Intent intent, String resolvedType, int flags, int userId) throws RemoteException {
-        IPackageManager pm = getPackageManager();
-        if (pm == null) return null;
-        return new ParceledListSlice<>(pm.queryIntentActivities(intent, resolvedType, flags, userId).getList());
+    @Nullable
+    public static ParcelableListSlice<ResolveInfo> queryIntentActivities(Intent intent, String resolvedType, int flags, int userId) {
+        try {
+            IPackageManager pm = getPackageManager();
+            if (pm == null) return null;
+            ParceledListSlice<ResolveInfo> infos;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                infos = pm.queryIntentActivities(intent, resolvedType, (long) flags, userId);
+            } else {
+                infos = pm.queryIntentActivities(intent, resolvedType, flags, userId);
+            }
+            return new ParcelableListSlice<>(infos.getList());
+        } catch (Exception e) {
+            Log.e(TAG, "queryIntentActivities", e);
+            return new ParcelableListSlice<>(new ArrayList<>());
+        }
     }
 
+    @Nullable
     public static Intent getLaunchIntentForPackage(String packageName) throws RemoteException {
         Intent intentToResolve = new Intent(Intent.ACTION_MAIN);
         intentToResolve.addCategory(Intent.CATEGORY_INFO);
         intentToResolve.setPackage(packageName);
-        ParceledListSlice<ResolveInfo> ris = queryIntentActivities(intentToResolve, intentToResolve.getType(), 0, 0);
+        var ris = queryIntentActivities(intentToResolve, intentToResolve.getType(), 0, 0);
 
         // Otherwise, try to find a main launcher activity.
-        if (ris == null || ris.getList().size() <= 0) {
+        if (ris == null || ris.getList().size() == 0) {
             // reuse the intent instance
             intentToResolve.removeCategory(Intent.CATEGORY_INFO);
             intentToResolve.addCategory(Intent.CATEGORY_LAUNCHER);
             intentToResolve.setPackage(packageName);
             ris = queryIntentActivities(intentToResolve, intentToResolve.getType(), 0, 0);
         }
-        if (ris == null || ris.getList().size() <= 0) {
+        if (ris == null || ris.getList().size() == 0) {
             return null;
         }
         Intent intent = new Intent(intentToResolve);
@@ -296,11 +338,17 @@ public class PackageService {
         return intent;
     }
 
+    public static void clearApplicationProfileData(String packageName) throws RemoteException {
+        IPackageManager pm = getPackageManager();
+        if (pm == null) return;
+        pm.clearApplicationProfileData(packageName);
+    }
+
     public static boolean performDexOptMode(String packageName) throws RemoteException {
         IPackageManager pm = getPackageManager();
         if (pm == null) return false;
         return pm.performDexOptMode(packageName,
                 SystemProperties.getBoolean("dalvik.vm.usejitprofiles", false),
-                "speed", true, true, null);
+                SystemProperties.get("pm.dexopt.install", "speed-profile"), true, true, null);
     }
 }

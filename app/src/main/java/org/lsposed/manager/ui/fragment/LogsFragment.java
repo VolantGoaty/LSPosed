@@ -20,12 +20,12 @@
 package org.lsposed.manager.ui.fragment;
 
 import android.annotation.SuppressLint;
+import android.content.ActivityNotFoundException;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.Menu;
+import android.view.MenuInflater;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
@@ -35,6 +35,7 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.core.view.MenuProvider;
 import androidx.fragment.app.Fragment;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
@@ -50,11 +51,11 @@ import org.lsposed.manager.R;
 import org.lsposed.manager.databinding.FragmentPagerBinding;
 import org.lsposed.manager.databinding.ItemLogTextviewBinding;
 import org.lsposed.manager.databinding.SwiperefreshRecyclerviewBinding;
+import org.lsposed.manager.receivers.LSPManagerServiceHolder;
 import org.lsposed.manager.ui.widget.EmptyStateRecyclerView;
 
 import java.io.BufferedReader;
 import java.io.FileInputStream;
-import java.io.IOException;
 import java.io.InputStreamReader;
 import java.time.LocalDateTime;
 import java.util.Arrays;
@@ -62,16 +63,11 @@ import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
-import java.util.zip.Deflater;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipOutputStream;
 
-import rikka.core.os.FileUtils;
 import rikka.material.app.LocaleDelegate;
 import rikka.recyclerview.RecyclerViewKt;
 
-public class LogsFragment extends BaseFragment {
-    private final Handler handler = new Handler(Looper.getMainLooper());
+public class LogsFragment extends BaseFragment implements MenuProvider {
     private FragmentPagerBinding binding;
     private LogPageAdapter adapter;
     private MenuItem wordWrap;
@@ -88,14 +84,17 @@ public class LogsFragment extends BaseFragment {
                 if (uri == null) return;
                 runAsync(() -> {
                     var context = requireContext();
-                    var contentResolver = context.getContentResolver();
-                    try (var os = new ZipOutputStream(contentResolver.openOutputStream(uri))) {
-                        os.setLevel(Deflater.BEST_COMPRESSION);
-                        zipLogs(os);
-                        os.finish();
-                    } catch (IOException e) {
-                        var text = context.getString(R.string.logs_save_failed2, e.getMessage());
+                    var cr = context.getContentResolver();
+                    try (var zipFd = cr.openFileDescriptor(uri, "wt")) {
+                        showHint(context.getString(R.string.logs_saving), false);
+                        LSPManagerServiceHolder.getService().getLogs(zipFd);
+                        showHint(context.getString(R.string.logs_saved), true);
+                    } catch (Throwable e) {
+                        var cause = e.getCause();
+                        var message = cause == null ? e.getMessage() : cause.getMessage();
+                        var text = context.getString(R.string.logs_save_failed2, message);
                         showHint(text, false);
+                        Log.w(App.TAG, "save log", e);
                     }
                 });
             });
@@ -128,9 +127,8 @@ public class LogsFragment extends BaseFragment {
         this.optionsItemSelectListener = optionsItemSelectListener;
     }
 
-    @SuppressLint("NotifyDataSetChanged")
     @Override
-    public boolean onOptionsItemSelected(@NonNull MenuItem item) {
+    public boolean onMenuItemSelected(@NonNull MenuItem item) {
         var itemId = item.getItemId();
         if (itemId == R.id.menu_save) {
             save();
@@ -143,18 +141,21 @@ public class LogsFragment extends BaseFragment {
             return true;
         }
         if (optionsItemSelectListener != null) {
-            if (optionsItemSelectListener.onOptionsItemSelected(item))
-                return true;
+            return optionsItemSelectListener.onOptionsItemSelected(item);
         }
-        return super.onOptionsItemSelected(item);
+        return false;
     }
 
     @Override
-    public void onPrepareOptionsMenu(@NonNull Menu menu) {
-        super.onPrepareOptionsMenu(menu);
+    public void onPrepareMenu(@NonNull Menu menu) {
         wordWrap = menu.findItem(R.id.menu_word_wrap);
         wordWrap.setChecked(App.getPreferences().getBoolean("enable_word_wrap", false));
         binding.viewPager.setUserInputEnabled(wordWrap.isChecked());
+    }
+
+    @Override
+    public void onCreateMenu(@NonNull Menu menu, @NonNull MenuInflater menuInflater) {
+
     }
 
     @Override
@@ -167,36 +168,11 @@ public class LogsFragment extends BaseFragment {
     private void save() {
         LocalDateTime now = LocalDateTime.now();
         String filename = String.format(LocaleDelegate.getDefaultLocale(), "LSPosed_%s.zip", now.toString());
-        saveLogsLauncher.launch(filename);
-    }
-
-    private static void zipLogs(ZipOutputStream os) {
-        var logs = ConfigManager.getLogs();
-        logs.forEach((name, fd) -> {
-            try (var is = new FileInputStream(fd.getFileDescriptor())) {
-                os.putNextEntry(new ZipEntry(name));
-                FileUtils.copy(is, os);
-                os.closeEntry();
-            } catch (IOException e) {
-                Log.w(App.TAG, name, e);
-            }
-        });
-
-        var now = LocalDateTime.now();
-        var name = "app_" + now.toString() + ".log";
-        try (var is = new ProcessBuilder("logcat", "-d").start().getInputStream()) {
-            os.putNextEntry(new ZipEntry(name));
-            FileUtils.copy(is, os);
-            os.closeEntry();
-        } catch (IOException e) {
-            Log.w(App.TAG, name, e);
+        try {
+            saveLogsLauncher.launch(filename);
+        } catch (ActivityNotFoundException e) {
+            showHint(R.string.enable_documentui, true);
         }
-    }
-
-    @Override
-    public void onDestroy() {
-        handler.removeCallbacksAndMessages(null);
-        super.onDestroy();
     }
 
     public static class LogFragment extends BaseFragment {
@@ -226,22 +202,26 @@ public class LogsFragment extends BaseFragment {
                 return log.size();
             }
 
-            void refresh() {
-                isLoaded = true;
-                runOnUiThread(this::notifyDataSetChanged);
+            @SuppressLint("NotifyDataSetChanged")
+            void refresh(List<CharSequence> log) {
+                runOnUiThread(() -> {
+                    isLoaded = true;
+                    this.log = log;
+                    notifyDataSetChanged();
+                });
             }
 
             void fullRefresh() {
                 runAsync(() -> {
                     isLoaded = false;
+                    List<CharSequence> tmp;
                     try (var parcelFileDescriptor = ConfigManager.getLog(verbose);
                          var br = new BufferedReader(new InputStreamReader(new FileInputStream(parcelFileDescriptor != null ? parcelFileDescriptor.getFileDescriptor() : null)))) {
-                        log = br.lines().parallel().collect(Collectors.toList());
+                        tmp = br.lines().parallel().collect(Collectors.toList());
                     } catch (Throwable e) {
-                        log = Arrays.asList(Log.getStackTraceString(e).split("\n"));
-                    } finally {
-                        refresh();
+                        tmp = Arrays.asList(Log.getStackTraceString(e).split("\n"));
                     }
+                    refresh(tmp);
                 });
             }
 
@@ -311,8 +291,7 @@ public class LogsFragment extends BaseFragment {
 
         void attachListeners() {
             var parent = getParentFragment();
-            if (parent instanceof LogsFragment) {
-                var logsFragment = (LogsFragment) parent;
+            if (parent instanceof LogsFragment logsFragment) {
                 logsFragment.binding.appBar.setLifted(!binding.recyclerView.getBorderViewDelegate().isShowingTopBorder());
                 binding.recyclerView.getBorderViewDelegate().setBorderVisibilityChangedListener((top, oldTop, bottom, oldBottom) -> logsFragment.binding.appBar.setLifted(!top));
                 logsFragment.setOptionsItemSelectListener(item -> {
@@ -352,7 +331,6 @@ public class LogsFragment extends BaseFragment {
         @Override
         public void onResume() {
             super.onResume();
-            adaptor.refresh();
             attachListeners();
         }
 
